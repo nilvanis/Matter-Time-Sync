@@ -6,8 +6,8 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
@@ -62,7 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     # 3. Store it in hass.data so button.py can access it
-    hass.data[DOMAIN][entry.entry_id] = {
+    entry_data = {
         "coordinator": coordinator,
         "device_filters": [
             t.strip().lower()
@@ -71,7 +71,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ],
         "only_time_sync_devices": entry.data.get("only_time_sync_devices", True),
         "filter_target": entry.data.get(CONF_FILTER_TARGET, DEFAULT_FILTER_TARGET),
+        "last_observed_offset": coordinator.get_current_flattened_offset(),
+        "dst_retry_cancel": None,
     }
+    hass.data[DOMAIN][entry.entry_id] = entry_data
 
     # 4. Forward entry setup to platforms (load button.py)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -81,12 +84,67 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     auto_sync_interval = entry.data.get(CONF_AUTO_SYNC_INTERVAL, DEFAULT_AUTO_SYNC_INTERVAL)
 
     if auto_sync_enabled:
+        def _cancel_dst_retry() -> None:
+            """Cancel any pending one-shot DST recovery retry."""
+            cancel = entry_data.get("dst_retry_cancel")
+            if cancel is not None:
+                cancel()
+                entry_data["dst_retry_cancel"] = None
+
+        async def _async_run_dst_retry() -> None:
+            """Run the one-shot retry after an observed offset change."""
+            if coordinator.is_auto_sync_running:
+                _LOGGER.debug(
+                    "Skipping DST recovery retry because auto-sync is already running"
+                )
+                return
+
+            _LOGGER.debug("Running one-time DST recovery retry after offset change")
+            try:
+                await coordinator.async_sync_all_devices(quiet_if_running=True)
+            except Exception as err:
+                _LOGGER.debug("DST recovery retry failed: %s", err, exc_info=True)
+
+        @callback
+        def _schedule_dst_retry() -> None:
+            """Schedule one delayed retry after a DST-related offset change."""
+            _cancel_dst_retry()
+            _LOGGER.debug("Scheduling one-time DST recovery retry in 10 minutes")
+
+            @callback
+            def _run_retry(_: Any) -> None:
+                entry_data["dst_retry_cancel"] = None
+                hass.async_create_task(_async_run_dst_retry())
+
+            entry_data["dst_retry_cancel"] = async_call_later(
+                hass, timedelta(minutes=10), _run_retry
+            )
 
         async def auto_sync_handler(now: Any) -> None:
             """Handle auto-sync timer."""
             _LOGGER.info("Auto-sync triggered (interval: %d minutes)", auto_sync_interval)
             try:
+                current_offset = coordinator.get_current_flattened_offset()
+                previous_offset = entry_data.get("last_observed_offset")
+                offset_changed = (
+                    previous_offset is not None and current_offset != previous_offset
+                )
+                if offset_changed:
+                    _LOGGER.debug(
+                        "Detected timezone offset change for entry %s: %s -> %s",
+                        entry.entry_id,
+                        previous_offset,
+                        current_offset,
+                    )
+                entry_data["last_observed_offset"] = current_offset
+
                 stats = await coordinator.async_sync_all_devices()
+
+                if offset_changed:
+                    if stats["failed"] > 0:
+                        _schedule_dst_retry()
+                    else:
+                        _cancel_dst_retry()
 
                 if stats["success"] > 0:
                     _LOGGER.info(
@@ -193,6 +251,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cancel = entry_data["auto_sync_cancel"]
         cancel()
         _LOGGER.info("Auto-sync timer cancelled")
+
+    dst_retry_cancel = entry_data.get("dst_retry_cancel")
+    if dst_retry_cancel is not None:
+        dst_retry_cancel()
+        _LOGGER.debug("Cancelled pending DST recovery retry")
+        entry_data["dst_retry_cancel"] = None
 
     # Disconnect from Matter Server
     if coordinator:

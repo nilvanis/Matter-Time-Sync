@@ -43,6 +43,25 @@ _TERMINAL_SYNC_FAILURES = {
     SYNC_FAILURE_SERVER_UNAVAILABLE,
 }
 
+SYNC_MODE_STANDARD_WITH_TZ_NAME = "standard_with_tz_name"
+SYNC_MODE_STANDARD_WITHOUT_TZ_NAME = "standard_without_tz_name"
+SYNC_MODE_TZ_OFFSET_MERGED_WITH_DST = "tz_offset_merged_with_dst"
+
+_COMPATIBILITY_ERROR_HINTS = (
+    "constrainterror",
+    "constraint error",
+    "unsupported",
+    "not supported",
+    "unknown field",
+    "unexpected field",
+    "invalid field",
+    "invalid command",
+    "invalid value",
+    "malformed",
+    "payload",
+    "schema",
+)
+
 
 @dataclass(slots=True)
 class CommandResult:
@@ -65,6 +84,28 @@ class SyncTimeResult:
     reason: str | None = None
     details: str | None = None
     failed_command: str | None = None
+
+
+@dataclass(slots=True)
+class SyncPayloadContext:
+    """Computed time payload inputs for a sync attempt."""
+
+    timezone: ZoneInfo
+    now_local: datetime
+    utc_now: datetime
+    total_offset: int
+    dst_offset: int
+    base_offset: int
+    utc_microseconds: int
+
+
+@dataclass(slots=True)
+class SyncModeAttemptResult:
+    """Internal result for a sync mode attempt."""
+
+    result: SyncTimeResult
+    cache_mode: str | None = None
+    fallback_to_merged_mode: bool = False
 
 
 def format_sync_failure_message(node_id: int, node_name: str, reason: str) -> str:
@@ -160,10 +201,18 @@ class MatterTimeSyncCoordinator:
         self._auto_sync_running = False
         self._auto_sync_lock = asyncio.Lock()
 
+        # Remember which payload mode works for each node during this runtime
+        self._node_sync_modes: dict[int, str] = {}
+
     @property
     def is_connected(self) -> bool:
         """Return True if connected to Matter Server."""
         return self._connected and self._ws is not None and not self._ws.closed
+
+    @property
+    def is_auto_sync_running(self) -> bool:
+        """Return True if a bulk auto-sync run is currently active."""
+        return self._auto_sync_running
 
     # ------------------------------------------------------------------
     # Connection management
@@ -460,6 +509,7 @@ class MatterTimeSyncCoordinator:
             if lock and lock.locked():
                 continue
             self._per_node_sync_locks.pop(nid, None)
+            self._node_sync_modes.pop(nid, None)
             _LOGGER.debug("Removed stale sync lock for node %s", nid)
 
         return self._nodes_cache
@@ -672,6 +722,410 @@ class MatterTimeSyncCoordinator:
         """Return True when the sync should stop after a failure."""
         return reason in _TERMINAL_SYNC_FAILURES
 
+    def _get_timezone(self) -> ZoneInfo:
+        """Return the configured timezone or UTC when invalid."""
+        try:
+            return ZoneInfo(self._timezone)
+        except Exception:
+            _LOGGER.warning("Invalid timezone %s, using UTC", self._timezone)
+            return ZoneInfo("UTC")
+
+    def get_current_flattened_offset(self) -> int:
+        """Return the current total UTC offset for the configured timezone."""
+        now = datetime.now(self._get_timezone())
+        return int(now.utcoffset().total_seconds()) if now.utcoffset() else 0
+
+    def _build_sync_payload_context(self) -> SyncPayloadContext:
+        """Compute the time payload values for a sync attempt."""
+        tz = self._get_timezone()
+        now_local = datetime.now(tz)
+        utc_now = now_local.astimezone(timezone.utc)
+        total_offset = (
+            int(now_local.utcoffset().total_seconds()) if now_local.utcoffset() else 0
+        )
+        dst_offset = int(now_local.dst().total_seconds()) if now_local.dst() else 0
+        base_offset = total_offset - dst_offset
+        utc_microseconds = _to_chip_epoch_us(utc_now)
+        return SyncPayloadContext(
+            timezone=tz,
+            now_local=now_local,
+            utc_now=utc_now,
+            total_offset=total_offset,
+            dst_offset=dst_offset,
+            base_offset=base_offset,
+            utc_microseconds=utc_microseconds,
+        )
+
+    def _cache_sync_mode(self, node_id: int, mode: str) -> None:
+        """Remember the working sync mode for a node."""
+        previous_mode = self._node_sync_modes.get(node_id)
+        self._node_sync_modes[node_id] = mode
+        if previous_mode != mode:
+            _LOGGER.debug(
+                "Cached sync mode for node %s: %s -> %s",
+                node_id,
+                previous_mode,
+                mode,
+            )
+
+    def _is_explicit_compatibility_failure(self, result: CommandResult) -> bool:
+        """Return True when the response indicates payload compatibility issues."""
+        if result.success or result.reason != SYNC_FAILURE_COMMAND_FAILED:
+            return False
+        details = " ".join(
+            str(part).lower()
+            for part in (result.error_code, result.details)
+            if part is not None
+        )
+        return any(hint in details for hint in _COMPATIBILITY_ERROR_HINTS)
+
+    def _find_offset_transition(
+        self,
+        tz: ZoneInfo,
+        start_utc: datetime,
+        direction: int,
+        max_days: int = 370,
+    ) -> datetime | None:
+        """Find the next offset transition in UTC by scanning then bisecting."""
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or 1")
+
+        current_offset = start_utc.astimezone(tz).utcoffset()
+        probe = start_utc
+
+        for _ in range(max_days):
+            candidate = probe + timedelta(days=direction)
+            if candidate.astimezone(tz).utcoffset() != current_offset:
+                low = min(probe, candidate)
+                high = max(probe, candidate)
+                low_ts = int(low.timestamp())
+                high_ts = int(high.timestamp())
+                if high > datetime.fromtimestamp(high_ts, tz=timezone.utc):
+                    high_ts += 1
+
+                while (high_ts - low_ts) > 1:
+                    midpoint_ts = (low_ts + high_ts) // 2
+                    midpoint = datetime.fromtimestamp(midpoint_ts, tz=timezone.utc)
+                    if midpoint.astimezone(tz).utcoffset() == current_offset:
+                        if direction > 0:
+                            low_ts = midpoint_ts
+                        else:
+                            high_ts = midpoint_ts
+                    else:
+                        if direction > 0:
+                            high_ts = midpoint_ts
+                        else:
+                            low_ts = midpoint_ts
+
+                return datetime.fromtimestamp(high_ts, tz=timezone.utc)
+
+            probe = candidate
+
+        return None
+
+    def _build_standard_dst_entries(
+        self, context: SyncPayloadContext, tz: ZoneInfo
+    ) -> list[dict[str, int]] | None:
+        """Build a standard DST window for the current or next DST interval."""
+        now_utc = context.utc_now
+
+        if context.dst_offset > 0:
+            dst_start_utc = self._find_offset_transition(tz, now_utc, direction=-1)
+            dst_end_utc = self._find_offset_transition(tz, now_utc, direction=1)
+            if not dst_start_utc or not dst_end_utc:
+                return None
+            return [
+                {
+                    "offset": context.dst_offset,
+                    "validStarting": _to_chip_epoch_us(dst_start_utc),
+                    "validUntil": _to_chip_epoch_us(dst_end_utc),
+                }
+            ]
+
+        next_transition_utc = self._find_offset_transition(tz, now_utc, direction=1)
+        if not next_transition_utc:
+            return []
+
+        next_local = (next_transition_utc + timedelta(seconds=1)).astimezone(tz)
+        next_dst_offset = int(next_local.dst().total_seconds()) if next_local.dst() else 0
+        if next_dst_offset <= 0:
+            return []
+
+        dst_end_utc = self._find_offset_transition(
+            tz, next_transition_utc + timedelta(seconds=1), direction=1
+        )
+        if not dst_end_utc:
+            return None
+
+        return [
+            {
+                "offset": next_dst_offset,
+                "validStarting": _to_chip_epoch_us(next_transition_utc),
+                "validUntil": _to_chip_epoch_us(dst_end_utc),
+            }
+        ]
+
+    async def _sync_time_standard(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        context: SyncPayloadContext,
+        sync_mode: str,
+    ) -> SyncModeAttemptResult:
+        """Try the Matter-standard sync flow for a node."""
+        include_tz_name = sync_mode == SYNC_MODE_STANDARD_WITH_TZ_NAME
+        effective_mode = sync_mode
+
+        tz_payload_entry: dict[str, Any] = {
+            "offset": context.base_offset,
+            "validAt": 0,
+        }
+        if include_tz_name:
+            tz_payload_entry["name"] = self._timezone
+
+        tz_response = await self._async_send_command(
+            "device_command",
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": TIME_SYNC_CLUSTER_ID,
+                "command_name": "SetTimeZone",
+                "payload": {"timeZone": [tz_payload_entry]},
+            },
+        )
+
+        if not tz_response.success and include_tz_name:
+            if self._is_terminal_sync_failure(tz_response.reason):
+                return SyncModeAttemptResult(
+                    self._command_result_to_sync_result(node_id, "SetTimeZone", tz_response)
+                )
+            if self._is_explicit_compatibility_failure(tz_response):
+                self._log_command_failure_debug(node_id, "SetTimeZone", tz_response)
+                _LOGGER.debug(
+                    "SetTimeZone with timezone name rejected for node %s, retrying without name",
+                    node_id,
+                )
+                effective_mode = SYNC_MODE_STANDARD_WITHOUT_TZ_NAME
+                tz_response = await self._async_send_command(
+                    "device_command",
+                    {
+                        "node_id": node_id,
+                        "endpoint_id": endpoint_id,
+                        "cluster_id": TIME_SYNC_CLUSTER_ID,
+                        "command_name": "SetTimeZone",
+                        "payload": {
+                            "timeZone": [
+                                {
+                                    "offset": context.base_offset,
+                                    "validAt": 0,
+                                }
+                            ]
+                        },
+                    },
+                )
+
+        if not tz_response.success:
+            tz_result = self._command_result_to_sync_result(
+                node_id, "SetTimeZone", tz_response
+            )
+            return SyncModeAttemptResult(
+                tz_result,
+                fallback_to_merged_mode=self._is_explicit_compatibility_failure(
+                    tz_response
+                ),
+            )
+
+        _LOGGER.debug(
+            "Standard SetTimeZone successful for node %s (offset=%d, mode=%s)",
+            node_id,
+            context.base_offset,
+            effective_mode,
+        )
+
+        dst_entries = self._build_standard_dst_entries(context, context.timezone)
+        if dst_entries is None:
+            _LOGGER.debug(
+                "Could not derive a standard DST window for node %s, falling back",
+                node_id,
+            )
+            return SyncModeAttemptResult(
+                self._sync_result(
+                    node_id,
+                    success=False,
+                    reason=SYNC_FAILURE_COMMAND_FAILED,
+                    details="Could not derive DST transition window",
+                    failed_command="SetDSTOffset",
+                ),
+                fallback_to_merged_mode=True,
+            )
+
+        if dst_entries:
+            dst_response = await self._async_send_command(
+                "device_command",
+                {
+                    "node_id": node_id,
+                    "endpoint_id": endpoint_id,
+                    "cluster_id": TIME_SYNC_CLUSTER_ID,
+                    "command_name": "SetDSTOffset",
+                    "payload": {"DSTOffset": dst_entries},
+                },
+            )
+
+            if not dst_response.success:
+                dst_result = self._command_result_to_sync_result(
+                    node_id, "SetDSTOffset", dst_response
+                )
+                return SyncModeAttemptResult(
+                    dst_result,
+                    fallback_to_merged_mode=self._is_explicit_compatibility_failure(
+                        dst_response
+                    ),
+                )
+
+            _LOGGER.debug(
+                "Standard SetDSTOffset successful for node %s (offset=%d)",
+                node_id,
+                dst_entries[0]["offset"],
+            )
+        else:
+            _LOGGER.debug(
+                "Timezone %s has no DST window to send for node %s",
+                self._timezone,
+                node_id,
+            )
+
+        payload_utc = {
+            "UTCTime": context.utc_microseconds,
+            "granularity": 4,
+        }
+
+        time_response = await self._async_send_command(
+            "device_command",
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": TIME_SYNC_CLUSTER_ID,
+                "command_name": "SetUTCTime",
+                "payload": payload_utc,
+            },
+        )
+
+        if not time_response.success:
+            return SyncModeAttemptResult(
+                self._command_result_to_sync_result(node_id, "SetUTCTime", time_response)
+            )
+
+        _LOGGER.debug("Standard SetUTCTime successful for node %s", node_id)
+        return SyncModeAttemptResult(
+            self._sync_result(node_id, success=True),
+            cache_mode=effective_mode,
+        )
+
+    async def _sync_time_tz_offset_merged_with_dst(
+        self,
+        node_id: int,
+        endpoint_id: int,
+        context: SyncPayloadContext,
+    ) -> SyncModeAttemptResult:
+        """Use the current compatibility path that merges DST into tz offset."""
+        utc_offset = context.total_offset
+        dst_offset = 0
+
+        tz_response = await self._async_send_command(
+            "device_command",
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": TIME_SYNC_CLUSTER_ID,
+                "command_name": "SetTimeZone",
+                "payload": {
+                    "timeZone": [
+                        {
+                            "offset": utc_offset,
+                            "validAt": 0,
+                        }
+                    ]
+                },
+            },
+        )
+
+        if tz_response.success:
+            _LOGGER.debug(
+                "Merged-offset SetTimeZone successful for node %s (offset=%d)",
+                node_id,
+                utc_offset,
+            )
+        else:
+            tz_result = self._command_result_to_sync_result(
+                node_id, "SetTimeZone", tz_response
+            )
+            if self._is_terminal_sync_failure(tz_result.reason):
+                return SyncModeAttemptResult(tz_result)
+            _LOGGER.debug(
+                "Merged-offset SetTimeZone failed for node %s with reason=%s (continuing)",
+                node_id,
+                tz_result.reason,
+            )
+
+        far_future_us = _to_chip_epoch_us(context.utc_now + timedelta(days=365))
+        dst_response = await self._async_send_command(
+            "device_command",
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": TIME_SYNC_CLUSTER_ID,
+                "command_name": "SetDSTOffset",
+                "payload": {
+                    "DSTOffset": [
+                        {
+                            "offset": dst_offset,
+                            "validStarting": 0,
+                            "validUntil": far_future_us,
+                        }
+                    ]
+                },
+            },
+        )
+
+        if dst_response.success:
+            _LOGGER.debug("Merged-offset SetDSTOffset successful for node %s", node_id)
+        else:
+            dst_result = self._command_result_to_sync_result(
+                node_id, "SetDSTOffset", dst_response
+            )
+            if self._is_terminal_sync_failure(dst_result.reason):
+                return SyncModeAttemptResult(dst_result)
+            _LOGGER.debug(
+                "Merged-offset SetDSTOffset failed for node %s with reason=%s (continuing)",
+                node_id,
+                dst_result.reason,
+            )
+
+        time_response = await self._async_send_command(
+            "device_command",
+            {
+                "node_id": node_id,
+                "endpoint_id": endpoint_id,
+                "cluster_id": TIME_SYNC_CLUSTER_ID,
+                "command_name": "SetUTCTime",
+                "payload": {
+                    "UTCTime": context.utc_microseconds,
+                    "granularity": 4,
+                },
+            },
+        )
+
+        if not time_response.success:
+            return SyncModeAttemptResult(
+                self._command_result_to_sync_result(node_id, "SetUTCTime", time_response)
+            )
+
+        _LOGGER.debug("Merged-offset SetUTCTime successful for node %s", node_id)
+        return SyncModeAttemptResult(
+            self._sync_result(node_id, success=True),
+            cache_mode=SYNC_MODE_TZ_OFFSET_MERGED_WITH_DST,
+        )
+
     # ------------------------------------------------------------------
     # Time synchronisation
     # ------------------------------------------------------------------
@@ -765,157 +1219,75 @@ class MatterTimeSyncCoordinator:
                         err,
                     )
 
-        try:
-            tz = ZoneInfo(self._timezone)
-        except Exception:
-            _LOGGER.warning("Invalid timezone %s, using UTC", self._timezone)
-            tz = ZoneInfo("UTC")
-
-        now = datetime.now(tz)
-        utc_now = now.astimezone(ZoneInfo("UTC"))
-
-        # Total UTC offset in seconds (includes DST when applicable)
-        total_offset = int(now.utcoffset().total_seconds()) if now.utcoffset() else 0
-
-        # FORCE DST TO 0 (merge DST into utc_offset)
-        utc_offset = total_offset
-        dst_offset = 0
-
-        # Matter Time Sync uses CHIP epoch (2000-01-01) in microseconds
-        utc_microseconds = _to_chip_epoch_us(utc_now)
+        context = self._build_sync_payload_context()
+        configured_mode = self._node_sync_modes.get(
+            node_id, SYNC_MODE_STANDARD_WITH_TZ_NAME
+        )
 
         _LOGGER.info(
-            "Syncing time for node %s: local=%s, UTC=%s, offset=%ds, DST=%ds (forced to 0)",
+            "Syncing time for node %s: local=%s, UTC=%s, total_offset=%ds, DST=%ds, mode=%s",
             node_id,
-            now.isoformat(),
-            utc_now.isoformat(),
-            utc_offset,
-            dst_offset,
+            context.now_local.isoformat(),
+            context.utc_now.isoformat(),
+            context.total_offset,
+            context.dst_offset,
+            configured_mode,
         )
 
-        # ---------------------------------------------------------
-        # 1) Set TimeZone FIRST
-        #    camelCase keys: the Matter server expects this format
-        # ---------------------------------------------------------
-        tz_list = [{"offset": utc_offset, "validAt": 0}]
+        if configured_mode == SYNC_MODE_TZ_OFFSET_MERGED_WITH_DST:
+            attempt = await self._sync_time_tz_offset_merged_with_dst(
+                node_id, endpoint_id, context
+            )
+            if attempt.result.success and attempt.cache_mode:
+                self._cache_sync_mode(node_id, attempt.cache_mode)
+                _LOGGER.info(
+                    "Time synced for node %s: %s (tz offset merged with DST)",
+                    node_id,
+                    context.now_local.isoformat(),
+                )
+            return attempt.result
 
-        tz_response = await self._async_send_command(
-            "device_command",
-            {
-                "node_id": node_id,
-                "endpoint_id": endpoint_id,
-                "cluster_id": TIME_SYNC_CLUSTER_ID,
-                "command_name": "SetTimeZone",
-                "payload": {"timeZone": tz_list},
-            },
+        attempt = await self._sync_time_standard(
+            node_id, endpoint_id, context, configured_mode
         )
-
-        if tz_response.success:
-            _LOGGER.debug(
-                "SetTimeZone successful for node %s (offset=%d)",
+        if attempt.result.success:
+            if attempt.cache_mode:
+                self._cache_sync_mode(node_id, attempt.cache_mode)
+            _LOGGER.info(
+                "Time synced for node %s: %s (standard mode: %s)",
                 node_id,
-                utc_offset,
+                context.now_local.isoformat(),
+                attempt.cache_mode or configured_mode,
             )
-        else:
-            tz_result = self._command_result_to_sync_result(
-                node_id, "SetTimeZone", tz_response
-            )
-            if self._is_terminal_sync_failure(tz_result.reason):
-                return tz_result
+            return attempt.result
+
+        if attempt.fallback_to_merged_mode:
             _LOGGER.debug(
-                "SetTimeZone failed for node %s with reason=%s (continuing)",
+                "Falling back to merged timezone offset mode for node %s",
                 node_id,
-                tz_result.reason,
             )
-
-        # ---------------------------------------------------------
-        # 2) Set DST Offset SECOND
-        #    "DSTOffset" outer key stays PascalCase (server expects it)
-        #    Inner keys use camelCase
-        # ---------------------------------------------------------
-        far_future_us = _to_chip_epoch_us(utc_now + timedelta(days=365))
-
-        dst_list = [
-            {
-                "offset": dst_offset,
-                "validStarting": 0,
-                "validUntil": far_future_us,
-            }
-        ]
-
-        dst_response = await self._async_send_command(
-            "device_command",
-            {
-                "node_id": node_id,
-                "endpoint_id": endpoint_id,
-                "cluster_id": TIME_SYNC_CLUSTER_ID,
-                "command_name": "SetDSTOffset",
-                "payload": {"DSTOffset": dst_list},
-            },
-        )
-
-        if dst_response.success:
-            _LOGGER.debug("SetDSTOffset successful for node %s", node_id)
-        else:
-            dst_result = self._command_result_to_sync_result(
-                node_id, "SetDSTOffset", dst_response
+            fallback_attempt = await self._sync_time_tz_offset_merged_with_dst(
+                node_id, endpoint_id, context
             )
-            if self._is_terminal_sync_failure(dst_result.reason):
-                return dst_result
-            _LOGGER.debug(
-                "SetDSTOffset not supported or failed for node %s with reason=%s (continuing)",
-                node_id,
-                dst_result.reason,
-            )
+            if fallback_attempt.result.success:
+                self._cache_sync_mode(node_id, SYNC_MODE_TZ_OFFSET_MERGED_WITH_DST)
+                _LOGGER.info(
+                    "Time synced for node %s: %s (fallback mode: %s)",
+                    node_id,
+                    context.now_local.isoformat(),
+                    SYNC_MODE_TZ_OFFSET_MERGED_WITH_DST,
+                )
+            return fallback_attempt.result
 
-        # ---------------------------------------------------------
-        # 3) Set UTC Time LAST
-        #    "UTCTime" stays PascalCase (server expects it)
-        #    "granularity" uses camelCase
-        # ---------------------------------------------------------
-        payload_utc = {
-            "UTCTime": utc_microseconds,
-            "granularity": 4,
-        }
-
-        _LOGGER.debug(
-            "Trying SetUTCTime for node %s, endpoint %s: %s",
-            node_id,
-            endpoint_id,
-            payload_utc,
-        )
-        time_response = await self._async_send_command(
-            "device_command",
-            {
-                "node_id": node_id,
-                "endpoint_id": endpoint_id,
-                "cluster_id": TIME_SYNC_CLUSTER_ID,
-                "command_name": "SetUTCTime",
-                "payload": payload_utc,
-            },
-        )
-
-        if not time_response.success:
-            return self._command_result_to_sync_result(
-                node_id, "SetUTCTime", time_response
-            )
-
-        _LOGGER.debug("SetUTCTime successful for node %s", node_id)
-
-        _LOGGER.info(
-            "Time synced for node %s: %s (UTC offset: %d, DST: %d)",
-            node_id,
-            now.isoformat(),
-            utc_offset,
-            dst_offset,
-        )
-        return self._sync_result(node_id, success=True)
+        return attempt.result
 
     # ------------------------------------------------------------------
     # Bulk sync
     # ------------------------------------------------------------------
 
-    async def async_sync_all_devices(self) -> dict[str, Any]:
+    async def async_sync_all_devices(
+        self, quiet_if_running: bool = False
+    ) -> dict[str, Any]:
         """Sync time on all filtered devices.
 
         Returns:
@@ -923,11 +1295,17 @@ class MatterTimeSyncCoordinator:
             {"success": int, "failed": int, "skipped": int, "errors": list}
         """
         if self._auto_sync_running:
+            if quiet_if_running:
+                _LOGGER.debug("Auto-sync already running, skipping quiet trigger")
+                return {"success": 0, "failed": 0, "skipped": 0, "errors": []}
             _LOGGER.warning("Auto-sync already running, skipping this trigger")
             return {"success": 0, "failed": 0, "skipped": 0, "errors": ["Already running"]}
 
         async with self._auto_sync_lock:
             if self._auto_sync_running:
+                if quiet_if_running:
+                    _LOGGER.debug("Auto-sync already running, skipping quiet trigger")
+                    return {"success": 0, "failed": 0, "skipped": 0, "errors": []}
                 _LOGGER.warning("Auto-sync already running (race condition), skipping")
                 return {"success": 0, "failed": 0, "skipped": 0, "errors": ["Already running"]}
             self._auto_sync_running = True
