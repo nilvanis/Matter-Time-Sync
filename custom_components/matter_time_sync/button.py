@@ -27,7 +27,12 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, DEFAULT_FILTER_TARGET
-from .coordinator import device_matches_filter, filter_candidates_for_node
+from .coordinator import (
+    SYNC_FAILURE_COMMAND_FAILED,
+    device_matches_filter,
+    filter_candidates_for_node,
+    log_sync_failure,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -378,10 +383,10 @@ class MatterTimeSyncButton(ButtonEntity):
             _LOGGER.info(
                 "Syncing time for Matter node %s (%s)", self._node_id, self._node_name
             )
-            success = await self._coordinator.async_sync_time(
+            result = await self._coordinator.async_sync_time_result(
                 self._node_id, endpoint=None
             )
-            if success:
+            if result.success:
                 self._last_synced = datetime.now(timezone.utc).isoformat()
                 self._last_sync_result = "success"
                 self.async_write_ha_state()
@@ -393,8 +398,8 @@ class MatterTimeSyncButton(ButtonEntity):
             else:
                 self._last_sync_result = "failed"
                 self.async_write_ha_state()
-                _LOGGER.error(
-                    "Time sync failed for %s (node %s)",
-                    self._node_name,
+                log_sync_failure(
                     self._node_id,
+                    self._node_name,
+                    result.reason or SYNC_FAILURE_COMMAND_FAILED,
                 )

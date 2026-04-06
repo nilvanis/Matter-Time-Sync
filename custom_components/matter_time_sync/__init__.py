@@ -23,7 +23,11 @@ from .const import (
     DEFAULT_AUTO_SYNC_INTERVAL,
     DEFAULT_FILTER_TARGET,
 )
-from .coordinator import MatterTimeSyncCoordinator
+from .coordinator import (
+    SYNC_FAILURE_COMMAND_FAILED,
+    MatterTimeSyncCoordinator,
+    log_sync_failure,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +55,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = MatterTimeSyncCoordinator(hass, entry)
 
     # 2. Connect to Matter Server immediately
-    connected = await coordinator.async_connect()
+    connected = await coordinator.async_connect(log_failure=False)
     if not connected:
         _LOGGER.error(
             "Failed to connect to Matter Server at startup. Will retry on first command."
@@ -90,13 +94,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         stats["success"],
                     )
 
-                if stats["failed"] > 0:
-                    _LOGGER.warning(
-                        "Auto-sync: %d devices failed. Errors: %s",
-                        stats["failed"],
-                        stats["errors"][:3],
-                    )
-
                 if stats["success"] == 0 and stats["failed"] == 0 and stats["skipped"] > 0:
                     _LOGGER.debug(
                         "Auto-sync: No devices to sync (%d skipped by filters)",
@@ -126,7 +123,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for eid, edata in hass.data[DOMAIN].items():
             coord = edata.get("coordinator")
             if coord:
-                await coord.async_sync_time(node_id, endpoint)
+                result = await coord.async_sync_time_result(node_id, endpoint)
+                if not result.success:
+                    log_sync_failure(
+                        node_id,
+                        result.node_name,
+                        result.reason or SYNC_FAILURE_COMMAND_FAILED,
+                    )
                 return
 
         _LOGGER.error("No Matter Time Sync coordinator found for sync_time")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +31,50 @@ _LOGGER = logging.getLogger(__name__)
 
 # Matter/CHIP epoch used by Time Synchronization cluster (microseconds since 2000-01-01)
 _CHIP_EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+SYNC_FAILURE_DEVICE_UNAVAILABLE = "device unavailable"
+SYNC_FAILURE_TIMEOUT = "timeout"
+SYNC_FAILURE_SERVER_UNAVAILABLE = "matter server unavailable"
+SYNC_FAILURE_COMMAND_FAILED = "sync command failed"
+
+_TERMINAL_SYNC_FAILURES = {
+    SYNC_FAILURE_DEVICE_UNAVAILABLE,
+    SYNC_FAILURE_TIMEOUT,
+    SYNC_FAILURE_SERVER_UNAVAILABLE,
+}
+
+
+@dataclass(slots=True)
+class CommandResult:
+    """Internal result for Matter server commands."""
+
+    success: bool
+    response: dict[str, Any] | None = None
+    reason: str | None = None
+    details: str | None = None
+    error_code: int | str | None = None
+    should_retry: bool = False
+
+
+@dataclass(slots=True)
+class SyncTimeResult:
+    """Result of a single device time sync."""
+
+    success: bool
+    node_name: str
+    reason: str | None = None
+    details: str | None = None
+    failed_command: str | None = None
+
+
+def format_sync_failure_message(node_id: int, node_name: str, reason: str) -> str:
+    """Build the user-visible sync failure log message."""
+    return f"Time sync failed for node {node_id} ({node_name}): {reason}"
+
+
+def log_sync_failure(node_id: int, node_name: str, reason: str) -> None:
+    """Emit the single visible warning for a failed sync attempt."""
+    _LOGGER.warning(format_sync_failure_message(node_id, node_name, reason))
 
 
 def _to_chip_epoch_us(dt: datetime) -> int:
@@ -124,7 +169,7 @@ class MatterTimeSyncCoordinator:
     # Connection management
     # ------------------------------------------------------------------
 
-    async def async_connect(self) -> bool:
+    async def async_connect(self, log_failure: bool = True) -> bool:
         """Connect to Matter Server WebSocket."""
         async with self._lock:
             if self.is_connected:
@@ -154,7 +199,10 @@ class MatterTimeSyncCoordinator:
                 _LOGGER.info("Connected to Matter Server at %s", self._ws_url)
                 return True
             except Exception as err:
-                _LOGGER.error("Failed to connect to Matter Server: %s", err)
+                if log_failure:
+                    _LOGGER.error("Failed to connect to Matter Server: %s", err)
+                else:
+                    _LOGGER.debug("Failed to connect to Matter Server: %s", err)
                 self._connected = False
                 if self._ws:
                     try:
@@ -203,7 +251,7 @@ class MatterTimeSyncCoordinator:
 
     async def _async_send_command(
         self, command: str, args: dict[str, Any] | None = None, retry: bool = True
-    ) -> dict[str, Any] | None:
+    ) -> CommandResult:
         """Send a command to the Matter Server and wait for response.
 
         The actual send/receive is performed inside _do_send_command while
@@ -218,27 +266,27 @@ class MatterTimeSyncCoordinator:
             result, should_retry = await self._do_send_command(command, args)
 
         # Handle retry outside _command_lock
-        if result is None and should_retry and retry:
-            _LOGGER.warning(
+        if not result.success and should_retry and retry:
+            _LOGGER.debug(
                 "WebSocket connection lost, reconnecting and retrying command %s",
                 command,
             )
             # Cleanup OUTSIDE _command_lock — safe lock ordering
             await self._cleanup_connection()
-            if await self.async_connect():
+            if await self.async_connect(log_failure=False):
                 async with self._command_lock:
                     result, _ = await self._do_send_command(command, args)
             return result
 
         # Clean up on non-retryable connection failures (outside _command_lock)
-        if result is None and not self._connected:
+        if not result.success and not self._connected:
             await self._cleanup_connection()
 
         return result
 
     async def _do_send_command(
         self, command: str, args: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any] | None, bool]:
+    ) -> tuple[CommandResult, bool]:
         """Send a command and wait for its response.
 
         Returns (response, should_retry).
@@ -250,8 +298,15 @@ class MatterTimeSyncCoordinator:
         self._connected = False and let the caller handle cleanup.
         """
         if not self.is_connected:
-            if not await self.async_connect():
-                return None, False
+            if not await self.async_connect(log_failure=False):
+                return (
+                    CommandResult(
+                        success=False,
+                        reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                        details="Failed to connect to Matter Server",
+                    ),
+                    False,
+                )
 
         self._message_id += 1
         message_id = str(self._message_id)
@@ -266,49 +321,82 @@ class MatterTimeSyncCoordinator:
         try:
             await self._ws.send_json(request)
 
-            async def _wait_for_response() -> dict[str, Any] | None:
+            async def _wait_for_response() -> CommandResult:
                 async for msg in self._ws:
                     if msg.type == WSMsgType.TEXT:
                         data = json.loads(msg.data)
                         if data.get("message_id") == message_id:
                             if "error_code" in data:
-                                _LOGGER.warning(
-                                    "Matter Server error for command %s: [%s] %s",
-                                    command,
-                                    data.get("error_code"),
-                                    data.get("details", "Unknown error"),
+                                details = data.get("details", "Unknown error")
+                                return CommandResult(
+                                    success=False,
+                                    reason=self._classify_server_error(details),
+                                    details=str(details),
+                                    error_code=data.get("error_code"),
                                 )
-                                return None
-                            return data
+                            return CommandResult(success=True, response=data)
                         # Unsolicited / mismatched message — log and skip
                         _LOGGER.debug(
                             "Ignoring unsolicited message (id=%s)",
                             data.get("message_id"),
                         )
                     elif msg.type == WSMsgType.ERROR:
-                        _LOGGER.error("WebSocket error: %s", msg.data)
-                        return None
-                    elif msg.type == WSMsgType.CLOSED:
-                        _LOGGER.warning("WebSocket closed unexpectedly")
                         self._connected = False
-                        return None
-                return None
+                        return CommandResult(
+                            success=False,
+                            reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                            details=str(msg.data),
+                        )
+                    elif msg.type == WSMsgType.CLOSED:
+                        self._connected = False
+                        return CommandResult(
+                            success=False,
+                            reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                            details="WebSocket closed unexpectedly",
+                            should_retry=True,
+                        )
+                self._connected = False
+                return CommandResult(
+                    success=False,
+                    reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                    details="WebSocket closed before response",
+                )
 
             response = await asyncio.wait_for(_wait_for_response(), timeout=10)
-            return response, False
+            return response, response.should_retry
 
         except asyncio.TimeoutError:
-            _LOGGER.error("Timeout waiting for response to %s", command)
-            return None, False
+            return (
+                CommandResult(
+                    success=False,
+                    reason=SYNC_FAILURE_TIMEOUT,
+                    details=f"Timeout waiting for response to {command}",
+                ),
+                False,
+            )
         except Exception as err:
             err_str = str(err).lower()
             if "closing" in err_str or "closed" in err_str:
                 self._connected = False
-                return None, True  # Signal caller to retry
+                return (
+                    CommandResult(
+                        success=False,
+                        reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                        details=str(err),
+                        should_retry=True,
+                    ),
+                    True,
+                )
 
-            _LOGGER.error("Error sending command to Matter Server: %s", err)
             self._connected = False
-            return None, False
+            return (
+                CommandResult(
+                    success=False,
+                    reason=SYNC_FAILURE_SERVER_UNAVAILABLE,
+                    details=str(err),
+                ),
+                False,
+            )
 
     # ------------------------------------------------------------------
     # Device name resolution
@@ -357,11 +445,11 @@ class MatterTimeSyncCoordinator:
 
     async def async_get_matter_nodes(self) -> list[dict[str, Any]]:
         """Get all Matter nodes from the server."""
-        response = await self._async_send_command("get_nodes")
-        if not response:
+        result = await self._async_send_command("get_nodes")
+        if not result.success or not result.response:
             return self._nodes_cache
 
-        raw_nodes = response.get("result", [])
+        raw_nodes = result.response.get("result", [])
         self._nodes_cache = self._parse_nodes(raw_nodes)
 
         # Clean up locks for nodes that no longer exist
@@ -461,11 +549,11 @@ class MatterTimeSyncCoordinator:
         Only called when debug logging is enabled to avoid unnecessary
         WebSocket round-trips during normal operation.
         """
-        response = await self._async_send_command("get_nodes")
-        if not response:
+        result = await self._async_send_command("get_nodes")
+        if not result.success or not result.response:
             return {}
 
-        raw_nodes = response.get("result", [])
+        raw_nodes = result.response.get("result", [])
         node = next((n for n in raw_nodes if n.get("node_id") == node_id), None)
         if not node:
             return {}
@@ -512,31 +600,113 @@ class MatterTimeSyncCoordinator:
                 err,
             )
 
+    def _get_cached_node(self, node_id: int) -> dict[str, Any] | None:
+        """Return cached node info for a node id."""
+        return next((n for n in self._nodes_cache if n.get("node_id") == node_id), None)
+
+    def _get_node_name(self, node_id: int) -> str:
+        """Return a stable display name for a node id."""
+        node = self._get_cached_node(node_id)
+        if node and node.get("name"):
+            return str(node["name"])
+        return f"Node {node_id}"
+
+    def _sync_result(
+        self,
+        node_id: int,
+        success: bool,
+        reason: str | None = None,
+        details: str | None = None,
+        failed_command: str | None = None,
+    ) -> SyncTimeResult:
+        """Build a sync result with the current node name."""
+        return SyncTimeResult(
+            success=success,
+            node_name=self._get_node_name(node_id),
+            reason=reason,
+            details=details,
+            failed_command=failed_command,
+        )
+
+    def _command_result_to_sync_result(
+        self, node_id: int, command_name: str, result: CommandResult
+    ) -> SyncTimeResult:
+        """Convert a failed command into a sync result."""
+        self._log_command_failure_debug(node_id, command_name, result)
+        return self._sync_result(
+            node_id,
+            success=False,
+            reason=result.reason or SYNC_FAILURE_COMMAND_FAILED,
+            details=result.details,
+            failed_command=command_name,
+        )
+
+    def _log_command_failure_debug(
+        self, node_id: int, command_name: str, result: CommandResult
+    ) -> None:
+        """Log raw Matter command failures only at debug level."""
+        if result.success:
+            return
+        _LOGGER.debug(
+            "Command %s failed for node %s: reason=%s, error_code=%s, details=%s",
+            command_name,
+            node_id,
+            result.reason,
+            result.error_code,
+            result.details,
+        )
+
+    def _classify_server_error(self, details: str | None) -> str:
+        """Map Matter server error details to a stable sync failure reason."""
+        details_lower = (details or "").lower()
+        if (
+            "operation aborted" in details_lower
+            or "not (yet) available" in details_lower
+            or "unavailable" in details_lower
+            or "offline" in details_lower
+        ):
+            return SYNC_FAILURE_DEVICE_UNAVAILABLE
+        return SYNC_FAILURE_COMMAND_FAILED
+
+    def _is_terminal_sync_failure(self, reason: str | None) -> bool:
+        """Return True when the sync should stop after a failure."""
+        return reason in _TERMINAL_SYNC_FAILURES
+
     # ------------------------------------------------------------------
     # Time synchronisation
     # ------------------------------------------------------------------
 
     async def async_sync_time(self, node_id: int, endpoint: int | None = None) -> bool:
+        """Backward-compatible bool wrapper for time sync."""
+        result = await self.async_sync_time_result(node_id, endpoint)
+        return result.success
+
+    async def async_sync_time_result(
+        self, node_id: int, endpoint: int | None = None
+    ) -> SyncTimeResult:
         """Sync time on a Matter device.
 
         Pass endpoint=None to auto-detect the correct endpoint.
         """
         lock = self._per_node_sync_locks.setdefault(node_id, asyncio.Lock())
 
-        async def _acquire_and_sync() -> bool:
+        async def _acquire_and_sync() -> SyncTimeResult:
             async with lock:
                 return await self._do_sync_time(node_id, endpoint)
 
         try:
             return await asyncio.wait_for(_acquire_and_sync(), timeout=20)
         except asyncio.TimeoutError:
-            _LOGGER.error(
-                "Timeout syncing node %s (exceeded 20s)",
+            return self._sync_result(
                 node_id,
+                success=False,
+                reason=SYNC_FAILURE_TIMEOUT,
+                details="Sync timed out after 20s",
             )
-            return False
 
-    async def _do_sync_time(self, node_id: int, endpoint: int | None = None) -> bool:
+    async def _do_sync_time(
+        self, node_id: int, endpoint: int | None = None
+    ) -> SyncTimeResult:
         """Internal method to perform time sync (called within lock)."""
         _LOGGER.debug("Starting time sync for node %s (endpoint %s)", node_id, endpoint)
 
@@ -640,15 +810,22 @@ class MatterTimeSyncCoordinator:
             },
         )
 
-        if tz_response:
+        if tz_response.success:
             _LOGGER.debug(
                 "SetTimeZone successful for node %s (offset=%d)",
                 node_id,
                 utc_offset,
             )
         else:
-            _LOGGER.warning(
-                "SetTimeZone failed for node %s (continuing anyway)", node_id
+            tz_result = self._command_result_to_sync_result(
+                node_id, "SetTimeZone", tz_response
+            )
+            if self._is_terminal_sync_failure(tz_result.reason):
+                return tz_result
+            _LOGGER.debug(
+                "SetTimeZone failed for node %s with reason=%s (continuing)",
+                node_id,
+                tz_result.reason,
             )
 
         # ---------------------------------------------------------
@@ -677,12 +854,18 @@ class MatterTimeSyncCoordinator:
             },
         )
 
-        if dst_response:
+        if dst_response.success:
             _LOGGER.debug("SetDSTOffset successful for node %s", node_id)
         else:
+            dst_result = self._command_result_to_sync_result(
+                node_id, "SetDSTOffset", dst_response
+            )
+            if self._is_terminal_sync_failure(dst_result.reason):
+                return dst_result
             _LOGGER.debug(
-                "SetDSTOffset not supported or failed for node %s (continuing anyway)",
+                "SetDSTOffset not supported or failed for node %s with reason=%s (continuing)",
                 node_id,
+                dst_result.reason,
             )
 
         # ---------------------------------------------------------
@@ -712,9 +895,10 @@ class MatterTimeSyncCoordinator:
             },
         )
 
-        if not time_response:
-            _LOGGER.error("Failed to set UTC time for node %s", node_id)
-            return False
+        if not time_response.success:
+            return self._command_result_to_sync_result(
+                node_id, "SetUTCTime", time_response
+            )
 
         _LOGGER.debug("SetUTCTime successful for node %s", node_id)
 
@@ -725,7 +909,7 @@ class MatterTimeSyncCoordinator:
             utc_offset,
             dst_offset,
         )
-        return True
+        return self._sync_result(node_id, success=True)
 
     # ------------------------------------------------------------------
     # Bulk sync
@@ -752,7 +936,7 @@ class MatterTimeSyncCoordinator:
         try:
             if not self.is_connected:
                 _LOGGER.debug("Connection lost, reconnecting for auto-sync")
-                if not await self.async_connect():
+                if not await self.async_connect(log_failure=False):
                     _LOGGER.error("Failed to connect to Matter Server for auto-sync")
                     return {
                         "success": 0,
@@ -808,18 +992,25 @@ class MatterTimeSyncCoordinator:
 
                     _LOGGER.info("Auto-syncing node %s (%s)", node_id, node_name)
                     try:
-                        success = await self.async_sync_time(node_id)
-                        if success:
+                        result = await self.async_sync_time_result(node_id)
+                        if result.success:
                             stats["success"] += 1
                             _LOGGER.debug("✓ Node %s synced successfully", node_id)
                         else:
                             stats["failed"] += 1
-                            error_msg = f"Node {node_id} ({node_name}) sync returned False"
+                            error_msg = (
+                                f"Node {node_id} ({node_name}): "
+                                f"{result.reason or SYNC_FAILURE_COMMAND_FAILED}"
+                            )
                             stats["errors"].append(error_msg)
-                            _LOGGER.warning("✗ Node %s sync failed", node_id)
+                            log_sync_failure(
+                                node_id,
+                                result.node_name or node_name,
+                                result.reason or SYNC_FAILURE_COMMAND_FAILED,
+                            )
 
                         # Update button entity attributes with sync result
-                        self._update_entity_sync_status(node_id, success)
+                        self._update_entity_sync_status(node_id, result.success)
 
                     except Exception as err:
                         stats["failed"] += 1
@@ -842,9 +1033,6 @@ class MatterTimeSyncCoordinator:
                     stats["failed"],
                     stats["skipped"],
                 )
-
-                if stats["errors"]:
-                    _LOGGER.warning("Auto-sync errors: %s", stats["errors"])
 
             await asyncio.wait_for(_sync_all(), timeout=120)
             return stats
